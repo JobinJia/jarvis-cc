@@ -30,7 +30,13 @@ class OllamaProvider(PhraseProvider):
             # Keep the model resident between bursty notifications so the
             # next event doesn't pay a cold reload (see OllamaConfig).
             "keep_alive": self.cfg.keep_alive,
-            "options": {"temperature": 0.7, "num_predict": 200},
+            "options": {
+                "temperature": 0.7,
+                "num_predict": 200,
+                # Explicit context size so the KV cache is sized for our
+                # ~1k-token prompts instead of the server default (32k).
+                "num_ctx": self.cfg.num_ctx,
+            },
         }
 
     async def generate(self, messages: list[dict[str, str]]) -> str:

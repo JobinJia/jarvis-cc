@@ -1,3 +1,4 @@
+import json
 import httpx
 import pytest
 import respx
@@ -162,3 +163,17 @@ async def test_siliconflow_raises_when_key_missing(monkeypatch: pytest.MonkeyPat
     p = SiliconFlowProvider(SiliconFlowConfig())
     with pytest.raises(RuntimeError):
         await p.generate(_MESSAGES)
+
+
+@pytest.mark.asyncio
+async def test_ollama_requests_bounded_context_window():
+    """The payload must pin `num_ctx` so the KV cache is sized for Jarvis's
+    ~1k-token prompts rather than Ollama's 32k server default."""
+    cfg = OllamaConfig(num_ctx=2048)
+    with respx.mock(base_url=cfg.base_url) as router:
+        route = router.post("/api/chat").respond(
+            200, json={"message": {"role": "assistant", "content": "Sir."}}
+        )
+        await OllamaProvider(cfg).generate(_MESSAGES)
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["options"]["num_ctx"] == 2048

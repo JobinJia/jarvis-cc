@@ -53,6 +53,13 @@ class OllamaConfig:
     # sub-second first token. Set "-1" to pin it permanently, "0" to unload
     # immediately after each call.
     keep_alive: str = "30m"
+    # Context window to request per call. Ollama 0.33's server default is
+    # 32768, and the KV cache for that alone is ~4-5 GB on an 8B model (or
+    # ~3.7 GB even on qwen3:0.6b) — memory the daemon then fights XTTS for.
+    # A Jarvis prompt is ~800 tokens (system + few-shots + avoid list) plus
+    # a 200-token reply, so 2048 leaves headroom while keeping the model's
+    # footprint close to its weights.
+    num_ctx: int = 2048
 
 
 @dataclass
