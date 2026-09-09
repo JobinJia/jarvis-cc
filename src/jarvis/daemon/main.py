@@ -679,9 +679,12 @@ class Daemon:
             if cancellable and sid and sid in self._cancelled_sessions:
                 logger.debug("DROP cancelled-before-play sid={}", sid)
                 return
+            # Whole line, not a prefix: this is the only record of what was
+            # said, and an audio complaint ("it babbled at the end") can only
+            # be matched to its text if the end is here too.
             logger.debug(
                 "PLAY type={} sid={} emotion={} text={!r}",
-                event.notification_type, sid, emotion, text[:80],
+                event.notification_type, sid, emotion, text,
             )
             if await self._try_stream(
                 text, lang, event.voice_id,
@@ -783,7 +786,7 @@ class Daemon:
                 spoken_parts.append(sentence)
                 logger.debug(
                     "STREAM-PLAY type={} sid={} emotion={} chunk={!r}",
-                    event.notification_type, sid, emotion, sentence[:80],
+                    event.notification_type, sid, emotion, sentence,
                 )
                 # Try streaming TTS first (e.g. XTTS/ElevenLabs), feeding the
                 # shared ffplay pipe; fall back to file-based synth+play for

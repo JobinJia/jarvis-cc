@@ -10,7 +10,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,7 @@ from loguru import logger
 
 from ...config import XTTSConfig
 from ...types import Lang
+from ..duration_guard import DurationBaseline
 from .base import TTSProvider
 
 _LANG_CODE = {"zh": "zh-cn", "en": "en"}
@@ -184,6 +185,86 @@ class XTTSProvider(TTSProvider):
         # the multi-GB model. RLock because _conditioning_for may call
         # _load_model while holding it.
         self._warm_lock = threading.RLock()
+        # Babble-tail guard: per-text clean-duration baseline, judged in
+        # _generate_piece. See XTTSConfig.duration_ratio_threshold.
+        self._baseline = DurationBaseline(
+            Path(cfg.duration_baseline_path).expanduser()
+        )
+
+    def _generate_piece(
+        self,
+        infer: Callable[[str], Any],
+        piece: str,
+        lang: Lang,
+        stop: threading.Event | None = None,
+    ) -> Any:
+        """Run `infer(piece)`, again while the take runs past the text's
+        clean duration; return the accepted float32 waveform.
+
+        XTTS's GPT sometimes misses its stop token after a very short input
+        and pads the line with a second or two of gibberish — heard as a
+        "wa wa wa" tail. Nothing about such a take is knowable up front,
+        but it IS longer than a clean one, so this is the CosyVoice
+        double-take loop (cosyvoice.synthesize) applied per GPT piece:
+        judge by duration against the text's baseline, regenerate on a
+        verdict, ship the shortest take if every attempt is flagged. Rates
+        and thresholds are in XTTSConfig.
+
+        Synchronous — runs on the caller's worker thread. `stop` (streaming)
+        ends the retries when playback has been cancelled; whatever is
+        returned then is never enqueued anyway.
+        """
+        import numpy as np  # type: ignore
+
+        fallback_cps = (
+            self.cfg.fallback_cps_zh if lang == "zh" else self.cfg.fallback_cps
+        )
+        attempts = max(1, self.cfg.max_synth_attempts)
+        best: Any = None
+        best_duration = 0.0
+        attempt = 0
+        for attempt in range(1, attempts + 1):
+            wav = np.asarray(infer(piece)["wav"], dtype=np.float32)
+            duration = len(wav) / _SAMPLE_RATE
+            verdict = self._baseline.check(
+                piece, duration,
+                ratio_threshold=self.cfg.duration_ratio_threshold,
+                fallback_cps=fallback_cps,
+            )
+            if duration > 0 and (best is None or duration < best_duration):
+                best, best_duration = wav, duration
+            if not verdict.is_repeat:
+                # Clean takes update the rolling-window baseline.
+                self._baseline.record(piece, duration)
+                if attempt > 1:
+                    logger.info(
+                        "xtts retry succeeded on attempt {}: {:.1f}s "
+                        "(ratio {:.2f}) text={!r}",
+                        attempt, duration, verdict.ratio, piece,
+                    )
+                return wav
+            logger.warning(
+                "xtts babble tail suspected: {:.1f}s audio for {} chars "
+                "(expected {:.1f}s, ratio {:.2f}), attempt {}/{}; "
+                "regenerating text={!r}",
+                duration, len(piece), verdict.expected, verdict.ratio,
+                attempt, attempts, piece,
+            )
+            if stop is not None and stop.is_set():
+                break
+        if best is None:
+            return np.zeros(0, dtype=np.float32)
+        # Every attempt flagged (or cancelled mid-retry): ship the shortest.
+        # Escape valve as in CosyVoice — learn its duration only if its pace
+        # is plausibly clean, so a baseline that drifted low can recover
+        # instead of flagging this text forever; a real babble take (too
+        # slow) is left unlearned.
+        self._baseline.record(piece, best_duration, min_cps=fallback_cps * 0.75)
+        logger.warning(
+            "xtts shipping shortest take ({:.1f}s) after {} attempts; text={!r}",
+            best_duration, attempt, piece,
+        )
+        return best
 
     def _ref_audio_for(self, lang: Lang) -> Path:
         path = self.cfg.ref_audio_zh if lang == "zh" else self.cfg.ref_audio_en
@@ -299,15 +380,17 @@ class XTTSProvider(TTSProvider):
             # see _PREROLL_SECONDS / _split_for_gpt for the two whys.
             parts = [np.zeros(int(sr * _PREROLL_SECONDS), dtype=np.float32)]
             for piece in _split_for_gpt(text):
-                out = tts.synthesizer.tts_model.inference(
-                    text=piece,
-                    language=language,
-                    gpt_cond_latent=latents["gpt_cond_latent"],
-                    speaker_embedding=latents["speaker_embedding"],
-                    temperature=temperature,
-                    speed=speed,
-                )
-                parts.append(np.asarray(out["wav"], dtype=np.float32))
+                parts.append(self._generate_piece(
+                    lambda p: tts.synthesizer.tts_model.inference(
+                        text=p,
+                        language=language,
+                        gpt_cond_latent=latents["gpt_cond_latent"],
+                        speaker_embedding=latents["speaker_embedding"],
+                        temperature=temperature,
+                        speed=speed,
+                    ),
+                    piece, lang,
+                ))
             wavfile.write(str(out_path), sr, _to_int16_pcm(np.concatenate(parts)))
 
         await asyncio.to_thread(_run_embedding)
@@ -414,21 +497,24 @@ class XTTSProvider(TTSProvider):
                     if stop.is_set():
                         break
                     t0 = time.perf_counter()
-                    # Cancellation is now only checked between pieces: a
-                    # batch decode has no yield point. Nothing is audible
-                    # either way — a cancelled piece was never enqueued — so
-                    # the only cost is finishing a decode whose audio is
-                    # then dropped.
-                    wav = model.synthesizer.tts_model.inference(
-                        text=piece,
-                        language=language,
-                        gpt_cond_latent=gpt_cond_latent,
-                        speaker_embedding=speaker_embedding,
-                        temperature=temperature,
-                        speed=speed,
-                    )["wav"]
-                    # _to_int16_pcm np.asarray()s it; inference() already
-                    # returns host-side samples, as the file path relies on too.
+                    # Cancellation is now only checked between pieces (and
+                    # between babble-guard retries): a batch decode has no
+                    # yield point. Nothing is audible either way — a
+                    # cancelled piece was never enqueued — so the only cost
+                    # is finishing a decode whose audio is then dropped.
+                    wav = self._generate_piece(
+                        lambda p: model.synthesizer.tts_model.inference(
+                            text=p,
+                            language=language,
+                            gpt_cond_latent=gpt_cond_latent,
+                            speaker_embedding=speaker_embedding,
+                            temperature=temperature,
+                            speed=speed,
+                        ),
+                        piece, lang, stop=stop,
+                    )
+                    # inference() returns host-side samples (the file path
+                    # relies on that too); the guard hands back float32.
                     blob = bytearray(_to_int16_pcm(wav).tobytes())
                     if blob and not stop.is_set():
                         loop.call_soon_threadsafe(queue.put_nowait, bytes(blob))

@@ -159,6 +159,29 @@ class XTTSConfig:
     speed_short: float = 1.15
     speed_long: float = 1.00
     short_threshold_chars: int = 60
+    # Babble-tail guard — the per-text duration baseline CosyVoice uses for
+    # double-takes (see tts/duration_guard.py), applied to each GPT piece.
+    # XTTS's GPT sometimes misses its stop token after a very short input
+    # and pads the line with a second or two of gibberish. Measured
+    # 2026-09-08 over the daemon log: 4.9% of 12-22-char sentences ran past
+    # 2x their expected length (14 of 285) versus 0-1% of 35-60-char ones —
+    # and since the two-short-sentence phrasing (2026-09-01) most lines are
+    # short, so ~1 announcement in 10 carried a tail. A take running past
+    # baseline x duration_ratio_threshold is regenerated, up to
+    # max_synth_attempts in total; if every attempt is flagged the shortest
+    # ships. A retry on a short piece costs ~1s wall.
+    #
+    # fallback_cps is the pre-baseline estimate: clean XTTS English measured
+    # median 13.8 chars/s (p10 9.5), so 12 with the 1.5x threshold flags
+    # anything under 8 chars/s — where the babble takes sat (5.6-7.7) and
+    # clean takes did not. Chinese runs ~3x slower per char, as in CosyVoice.
+    # The baseline file is separate from CosyVoice's: different model,
+    # different pace.
+    duration_ratio_threshold: float = 1.5
+    fallback_cps: float = 12.0
+    fallback_cps_zh: float = 4.5
+    max_synth_attempts: int = 3
+    duration_baseline_path: str = "~/.jarvis/cache/xtts_duration_baseline.json"
     # `stream_chunk_size` lived here until 2026-08-25, tuned to 20 on MPS.
     # It is gone rather than deprecated: the provider no longer calls
     # `inference_stream` at all (see xtts._produce — each piece was already

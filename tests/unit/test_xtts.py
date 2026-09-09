@@ -493,3 +493,196 @@ def test_operator_pinned_ratio_wins():
     with patch.dict(os.environ, {"PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.9"}):
         XTTSProvider(XTTSConfig(device="mps", mps_memory_ratio=0.2))
         assert os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.9"
+
+
+# --- babble-tail guard -------------------------------------------------------
+#
+# XTTS's GPT sometimes misses its stop token after a very short input and
+# appends a second or two of gibberish. Measured 2026-09-08: "The task is
+# clear." (18 chars) came out at 3.0s where a clean take is ~1.3s. The guard
+# judges each GPT piece by duration against its clean baseline (chars /
+# fallback_cps before one exists) and regenerates on a verdict.
+
+
+def _seconds(n: float):
+    import numpy as np
+
+    return {"wav": np.zeros(int(24000 * n), dtype=np.float32)}
+
+
+def _guarded_cfg(tmp_path: Path, **overrides) -> XTTSConfig:
+    fields = dict(
+        model_dir=str(tmp_path / "model"),
+        ref_audio_zh=str(tmp_path / "z.wav"),
+        ref_audio_en=str(tmp_path / "e.wav"),
+        speaker_embedding="",
+        device="cpu",
+        duration_baseline_path=str(tmp_path / "xtts_baseline.json"),
+    )
+    fields.update(overrides)
+    return XTTSConfig(**fields)
+
+
+@pytest.mark.asyncio
+async def test_xtts_stream_regenerates_babble_tail(tmp_path: Path):
+    """A take running past 1.5x the chars/cps estimate is regenerated and the
+    clean second take is what reaches the sink — the first never does."""
+    import json
+
+    cfg = _guarded_cfg(tmp_path)
+    p = XTTSProvider(cfg)
+    fake_model = MagicMock()
+    # 18 chars / 12 cps = 1.5s expected; 3.0s is ratio 2.0 → flagged.
+    fake_model.synthesizer.tts_model.inference.side_effect = [
+        _seconds(3.0), _seconds(1.3),
+    ]
+
+    with patch.object(p, "_load_model", return_value=fake_model), \
+            patch.object(p, "_conditioning_for", return_value=("g", "s")):
+        chunks = [c async for c in p.stream("The task is clear.", lang="en")]
+
+    assert fake_model.synthesizer.tts_model.inference.call_count == 2
+    assert len(chunks) == 2  # pre-roll + ONE piece: the flagged take is gone
+    assert len(chunks[1]) == int(24000 * 1.3) * 2
+    # The accepted take seeds the per-text baseline; the babble one did not.
+    baseline = json.loads((tmp_path / "xtts_baseline.json").read_text())
+    assert baseline["The task is clear."] == [pytest.approx(1.3)]
+
+
+@pytest.mark.asyncio
+async def test_xtts_stream_ships_shortest_take_when_every_attempt_babbles(
+    tmp_path: Path,
+):
+    """All max_synth_attempts flagged → the shortest take ships, so the
+    daemon still speaks; the attempt budget is honoured exactly."""
+    cfg = _guarded_cfg(tmp_path, max_synth_attempts=3)
+    p = XTTSProvider(cfg)
+    fake_model = MagicMock()
+    fake_model.synthesizer.tts_model.inference.side_effect = [
+        _seconds(3.0), _seconds(3.5), _seconds(2.8), _seconds(1.0),
+    ]
+
+    with patch.object(p, "_load_model", return_value=fake_model), \
+            patch.object(p, "_conditioning_for", return_value=("g", "s")):
+        chunks = [c async for c in p.stream("The task is clear.", lang="en")]
+
+    assert fake_model.synthesizer.tts_model.inference.call_count == 3
+    assert len(chunks[1]) == int(24000 * 2.8) * 2
+
+
+@pytest.mark.asyncio
+async def test_xtts_stream_clean_take_is_not_retried(tmp_path: Path):
+    """A take at normal pace passes first time — the guard must not add
+    latency to the 95% of pieces that are fine."""
+    cfg = _guarded_cfg(tmp_path)
+    p = XTTSProvider(cfg)
+    fake_model = MagicMock()
+    fake_model.synthesizer.tts_model.inference.side_effect = [
+        _seconds(1.3), _seconds(9.9),
+    ]
+
+    with patch.object(p, "_load_model", return_value=fake_model), \
+            patch.object(p, "_conditioning_for", return_value=("g", "s")):
+        chunks = [c async for c in p.stream("The task is clear.", lang="en")]
+
+    assert fake_model.synthesizer.tts_model.inference.call_count == 1
+    assert len(chunks[1]) == int(24000 * 1.3) * 2
+
+
+@pytest.mark.asyncio
+async def test_xtts_stream_uses_recorded_baseline_over_char_estimate(
+    tmp_path: Path,
+):
+    """Once a text has clean takes on record, their median — not the chars
+    estimate — is the yardstick, so a line this voice habitually reads
+    slowly is not flagged forever."""
+    import json
+
+    (tmp_path / "xtts_baseline.json").write_text(
+        json.dumps({"The task is clear.": [2.4, 2.5, 2.6]})
+    )
+    cfg = _guarded_cfg(tmp_path)
+    p = XTTSProvider(cfg)
+    fake_model = MagicMock()
+    # 2.6s would be ratio 1.73 against the 1.5s chars estimate — flagged —
+    # but is 1.04 against the recorded 2.5s median.
+    fake_model.synthesizer.tts_model.inference.side_effect = [_seconds(2.6)]
+
+    with patch.object(p, "_load_model", return_value=fake_model), \
+            patch.object(p, "_conditioning_for", return_value=("g", "s")):
+        chunks = [c async for c in p.stream("The task is clear.", lang="en")]
+
+    assert fake_model.synthesizer.tts_model.inference.call_count == 1
+    assert len(chunks[1]) == int(24000 * 2.6) * 2
+
+
+@pytest.mark.asyncio
+async def test_xtts_synthesize_embedding_path_regenerates_babble_tail(
+    tmp_path: Path,
+):
+    """The file-based path (used for the session_start briefing) runs the
+    same guard: the wav written holds the clean take only."""
+    import numpy as np
+    from scipy.io import wavfile
+
+    pth = tmp_path / "jarvis_speaker.pth"
+    pth.write_bytes(b"\x00")
+    cfg = _guarded_cfg(tmp_path, speaker_embedding=str(pth))
+    p = XTTSProvider(cfg)
+    fake_tts = MagicMock()
+    fake_tts.synthesizer.output_sample_rate = 24000
+    fake_tts.synthesizer.tts_model.inference.side_effect = [
+        _seconds(3.0), _seconds(1.3),
+    ]
+    latents = {"gpt_cond_latent": object(), "speaker_embedding": object()}
+
+    out = tmp_path / "out.wav"
+    with patch.object(p, "_load_model", return_value=fake_tts), patch.object(
+        p, "_load_latents", return_value=latents
+    ):
+        await p.synthesize("The task is clear.", lang="en", out_path=out)
+
+    assert fake_tts.synthesizer.tts_model.inference.call_count == 2
+    sr, samples = wavfile.read(str(out))
+    # 0.25s amp-wake pre-roll + the 1.3s clean take, nothing of the 3.0s one.
+    assert len(samples) == int(24000 * 0.25) + int(24000 * 1.3)
+    assert samples.dtype == np.int16
+
+
+@pytest.mark.asyncio
+async def test_xtts_stream_stops_retrying_when_playback_cancelled(
+    tmp_path: Path,
+):
+    """A cancelled consumer sets the stop flag; a flagged take must not keep
+    burning decodes for audio nobody will hear."""
+    import asyncio
+    import threading
+
+    cfg = _guarded_cfg(tmp_path, max_synth_attempts=3)
+    p = XTTSProvider(cfg)
+    fake_model = MagicMock()
+    # Attempt 1 is flagged at once; attempt 2 blocks until the test lets it
+    # go, so the cancel lands while a retry is in flight. Everything is
+    # flagged, so without the stop check a third attempt would follow.
+    release = threading.Event()
+    calls = 0
+
+    def _infer(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            release.wait(5)
+        return _seconds(3.0)
+
+    fake_model.synthesizer.tts_model.inference.side_effect = _infer
+
+    with patch.object(p, "_load_model", return_value=fake_model), \
+            patch.object(p, "_conditioning_for", return_value=("g", "s")):
+        agen = p.stream("The task is clear.", lang="en")
+        await agen.__anext__()  # pre-roll: the producer thread is running
+        closing = asyncio.ensure_future(agen.aclose())  # sets stop, joins
+        await asyncio.sleep(0.05)  # aclose has set stop and is now waiting
+        release.set()  # attempt 2 returns into a set stop flag
+        await closing
+
+    assert calls == 2
